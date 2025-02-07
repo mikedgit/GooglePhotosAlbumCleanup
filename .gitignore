@@ -1,7 +1,9 @@
 credentials.json
 token.json
+client_secret.json
+.DS_Store
 venv/
 GooglePhotosAlbumCleanup.log
 mouse_locations.txt
-Google Photos Album List.md
-Google Photos Albums to Delete.md
+Google Photos Album List.xlsx
+~$Google Photos Album List.xlsx

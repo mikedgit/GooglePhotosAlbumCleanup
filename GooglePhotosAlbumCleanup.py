@@ -6,14 +6,27 @@ from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from tabulate import tabulate
 import webbrowser
 import pyautogui
 import configparser
 import platform
+import pandas as pd
 
 # Define a constant for the config file name
 CONFIG_FILENAME = 'GooglePhotosAlbumCleanupConfig.ini'
+# Global translation matrix for spreadsheet headers to what the script expects.  You can edit the headers here to match your spreadsheet.
+LONG_TO_SHORT_HEADERS = {
+    "Album Title": "Album Title",
+    "Album New Title (Renamer will use this title)": "Album New Title",
+    "Photo Count": "Photo Count",
+    "Flagged for Deletion (Deleter will delete any album with the word ""TRUE"" in here)": "Delete Flag",
+    "Album ID": "Album ID",
+    "Album URL": "Album URL",
+    "Actions Log": "Actions",
+}
+# Create an inverse of this dictionary for translating back
+SHORT_TO_LONG_HEADERS = {v: k for k, v in LONG_TO_SHORT_HEADERS.items()}
+
 
 def read_config_and_set_up_logging(filename):
     # Create a ConfigParser object
@@ -34,7 +47,26 @@ def read_config_and_set_up_logging(filename):
         with open(log_file, 'w'):
             pass
         # Set up logging
-        logging.basicConfig(filename=log_file, level=logging.INFO)
+        # Create a logger
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        # Create a file handler that logs messages to a file
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+
+        # Create a console handler that logs messages to the console
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+
+        # Add handlers to the logger
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+
     except (configparser.NoSectionError, configparser.NoOptionError) as e:
         logging.error(f"Aborting. Failed to get log file parameter from config file {filename}: {e}")
         return False
@@ -42,12 +74,13 @@ def read_config_and_set_up_logging(filename):
     # Try to get the required parameters
     parameters = {}
     try:
-        parameters['three_dots'] = tuple(map(int, config.get('AlbumWindowMouseClicks', 'three_dots').split(',')))
-        parameters['delete_button'] = tuple(map(int, config.get('AlbumDeleteMouseClicks', 'delete_button').split(',')))
-        parameters['confirm_delete_button'] = tuple(map(int, config.get('AlbumDeleteMouseClicks', 'confirm_delete_button').split(',')))
-        parameters['rename_button'] = tuple(map(int, config.get('AlbumRenameMouseClicks', 'rename_button').split(',')))
-        parameters['rename_textbox'] = tuple(map(int, config.get('AlbumRenameMouseClicks', 'rename_textbox').split(',')))
-        parameters['rename_save_button'] = tuple(map(int, config.get('AlbumRenameMouseClicks', 'rename_save_button').split(',')))
+        parameters['three_dots'] = tuple(map(float, config.get('AlbumWindowMouseClicks', 'three_dots').split(',')))
+        parameters['macos_scale_factor'] = config.getfloat('AlbumWindowMouseClicks', 'macos_scale_factor')
+        parameters['delete_button'] = tuple(map(float, config.get('AlbumDeleteMouseClicks', 'delete_button').split(',')))
+        parameters['confirm_delete_button'] = tuple(map(float, config.get('AlbumDeleteMouseClicks', 'confirm_delete_button').split(',')))
+        parameters['rename_button'] = tuple(map(float, config.get('AlbumRenameMouseClicks', 'rename_button').split(',')))
+        parameters['rename_textbox'] = tuple(map(float, config.get('AlbumRenameMouseClicks', 'rename_textbox').split(',')))
+        parameters['rename_save_button'] = tuple(map(float, config.get('AlbumRenameMouseClicks', 'rename_save_button').split(',')))
         parameters['album_list_file'] = config.get('AlbumLister', 'album_list_file')
         parameters['album_list_length_limit'] = config.getint('AlbumLister', 'album_list_length_limit')
         parameters['albums_to_delete_list_file'] = config.get('AlbumDeleteLister', 'albums_to_delete_list_file')
@@ -66,6 +99,53 @@ def read_config_and_set_up_logging(filename):
         return False
 
     return parameters
+
+def read_xlsx_with_renamed_columns(file_path):
+    """
+    Reads a DataFrame from an XLSX file, renames columns, and logs errors for missing columns or file.
+
+    :param file_path: Path to the XLSX file.
+    :return: A pandas DataFrame with renamed columns or None if an error occurs.
+    """
+    # Check if the file exists
+    if not os.path.exists(file_path):
+        logging.error(f"File not found: {file_path}")
+        return None
+
+    # Read the XLSX file
+    try:
+        df = pd.read_excel(file_path)
+    except Exception as e:
+        logging.error(f"Error reading the Excel file: {e}")
+        return None
+
+    # Check for missing expected columns
+    missing_columns = set(LONG_TO_SHORT_HEADERS.keys()) - set(df.columns)
+    if missing_columns:
+        logging.error(f"Missing expected columns: {missing_columns}")
+        return None
+
+    # Rename columns
+    df.rename(columns=LONG_TO_SHORT_HEADERS, inplace=True)
+    return df
+
+def write_xlsx_with_renamed_columns(df, output_file_path):
+    """
+    Writes the given DataFrame to an XLSX file. Overwrites the file if it already exists and logs the event.
+
+    :param df: The DataFrame to write.
+    :param output_file_path: The path to the output XLSX file.
+    """
+
+    # Check if the file already exists
+    if os.path.exists(output_file_path):
+        logging.info(f"Overwriting existing file: {output_file_path}")
+    # Rename columns
+    df.rename(columns=SHORT_TO_LONG_HEADERS, inplace=True)
+    # Write DataFrame to an XLSX file
+    df.to_excel(output_file_path, index=False)
+    logging.info(f"Data written to {output_file_path}")
+
 
 def google_photos_album_lister(scope, credentials_file, token_file, album_list_length_limit):
     # Define the scope for the access request
@@ -95,10 +175,12 @@ def google_photos_album_lister(scope, credentials_file, token_file, album_list_l
     # Note: static_discovery=False is required to avoid an error
     service = build('photoslibrary', 'v1', credentials=creds,static_discovery=False)
 
+    # Initialize a dictionary to hold album data
+    album_data = {'Album Title': [], 'Album New Title': [], 'Photo Count': [], 'Delete Flag': [], 'Album ID': [], 'Album URL': [], 'Actions': []}
+
     # Call the Photo v1 API
-    logging.info('Polling Google Photos and Listing albums...')
+    logging.info('Polling Google Photos and Listing albums...If you have a lot, this may take a while.')
     page_token = None
-    album_list = []
     page_count = 0
     while True:
         try:
@@ -116,80 +198,83 @@ def google_photos_album_lister(scope, credentials_file, token_file, album_list_l
                 try:
                     title = album.get('title', 'Untitled')
                     mediaItemsCount = album.get('mediaItemsCount', 0)
-                    is_shared = 'shareInfo' in album
                     albumId = album.get('id', 'No ID')
                     url = album.get('productUrl', 'No URL')
-                    album_list.append([title, mediaItemsCount, is_shared, albumId, url])
+                    # Append album details to the dictionary
+                    album_data['Album Title'].append(title)
+                    album_data['Album New Title'].append('')  # Placeholder value
+                    album_data['Photo Count'].append(mediaItemsCount)
+                    album_data['Delete Flag'].append('')  # Placeholder value
+                    album_data['Album ID'].append(albumId)
+                    album_data['Album URL'].append(url)
+                    album_data['Actions'].append('')  # Placeholder value
                 except Exception as e:
                     logging.error(f"Error processing album: {e}")
         page_token = results.get('nextPageToken')
-        if len(album_list) > album_list_length_limit: 
-            break
+        # if len(album_data['Album Title']) > album_list_length_limit: 
+        #     break
         if not page_token:
             break
         time.sleep(1) # Sleep for 1 second to avoid rate limiting
-    return album_list
+    # Convert the dictionary to a DataFrame
+    df_albums = pd.DataFrame(album_data)
+    # Ensure 'Album New Title' column is of type object (string)
+    # df_albums['Album New Title'] = df_albums['Album New Title'].astype(str)
+    return df_albums
 
-def read_album_list_from_file(filename):
-    with open(filename, 'r') as f:
-        # Skip the first line (headers)
-        next(f)
-        # Read the rest of the lines into a list
-        table = [line.strip().split('|') for line in f]
-    # Remove the first and last elements of each list (the pipe characters)
-    for row in table:
-        row.pop(0)
-        row.pop()
-    return table
-
-def find_albums_to_delete(album_list, delete_empty_albums, delete_albums_that_contain):
-    albums_to_delete = []
+def mark_albums_to_delete(album_list, delete_empty_albums, delete_albums_that_contain):
     # convert delete_albums_that_contain to a list if it's just a simple string
     if isinstance(delete_albums_that_contain, str):
         delete_albums_that_contain = [delete_albums_that_contain]
-    for album in album_list:
+    for index, album in album_list.iterrows():
         # Find albums with no photos
-        if delete_empty_albums and album[1] == '0':
-            albums_to_delete.append(album)
+        if delete_empty_albums and album['Photo Count'] == '0':
+            album_list.at[index, 'Delete Flag'] = True
         # Find albums that contain any of the specified strings
-        elif delete_albums_that_contain[0] and any(s in album[0] for s in delete_albums_that_contain):
-            albums_to_delete.append(album)            
+        elif delete_albums_that_contain[0] and any(s in album['Album Title'] for s in delete_albums_that_contain):
+            album_list.at[index, 'Delete Flag'] = True
         # Find albums with 'iPhoto Events' and a date in the name
-        elif 'iPhoto Events' in album[0] and re.search(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b \d{1,2}, \d{4}', album[0]):
-            albums_to_delete.append(album)
+        elif 'iPhoto Events' in album['Album Title'] and re.search(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b \d{1,2}, \d{4}', album['Album Title']):
+            album_list.at[index, 'Delete Flag'] = True
         # Add your own criteria here!  Replace the 'False' with your own criteria
         elif False:
-            albums_to_delete.append(album)
-        # # Find albums with 'iPhoto Events' and a date in the name
-        # elif 'iPhoto Events' in album[0] and re.search(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b \d{1,2}, \d{4}', album[0]):
-        #     albums_to_delete.append(album)
-    return albums_to_delete
+            album_list.at[index, 'Delete Flag'] = True
+    return album_list
 
-def delete_albums(albums_to_delete, max_albums_to_delete, three_dots_coordinates, delete_coordinates, confirm_coordinates, page_load_wait_time=1.0, mouse_move_wait_time=1.0, mouse_click_wait_time=1.0):
+def delete_albums(album_list, max_albums_to_delete, macos_scale_factor, three_dots_coordinates, delete_coordinates, confirm_coordinates, page_load_wait_time=1.0, mouse_move_wait_time=1.0, mouse_click_wait_time=1.0):
     albums_deleted = 0
-    for album in albums_to_delete:
+    if platform.system() == 'Darwin':  # Darwin is the name for the macOS operating system
+        scale_factor = macos_scale_factor
+    else:
+        scale_factor = 1.0
+    for index, album in album_list.iterrows():
+        if bool(album['Delete Flag']) != True:
+            continue
+        if bool(album['Delete Flag']) == True and 'Deleted' in str(album['Actions']):
+            continue
         if albums_deleted >= max_albums_to_delete:
             logging.info(f"Reached maximum number of albums to delete ({max_albums_to_delete}). Exiting.")
             break
-        logging.info(f"Deleting album: {album[0]} at {album[4]}")
+        logging.info(f"Deleting album: {album['Album Title']} at {album['Album URL']}")
         # First let's open the web browser to the Google Photos Album page
-        webbrowser.open(album[4])
+        webbrowser.open(album['Album URL'])
         time.sleep(page_load_wait_time) # Sleep to allow the page to load
         # Now let's click the three dots at the top right of the page
-        pyautogui.moveTo(three_dots_coordinates)
+        pyautogui.moveTo(three_dots_coordinates*scale_factor)
         time.sleep(mouse_move_wait_time)
-        pyautogui.click(three_dots_coordinates)
+        pyautogui.click(three_dots_coordinates*scale_factor)
         time.sleep(mouse_click_wait_time) # Sleep for 1 second to allow the menu to load
         # Now let's click the 'Delete' button
-        pyautogui.moveTo(delete_coordinates)
+        pyautogui.moveTo(delete_coordinates*scale_factor)
         time.sleep(mouse_move_wait_time)
-        pyautogui.click(delete_coordinates)
+        pyautogui.click(delete_coordinates*scale_factor)
         time.sleep(mouse_click_wait_time)
         # Now let's confirm the deletion in the dialog box
-        pyautogui.moveTo(confirm_coordinates)
+        pyautogui.moveTo(confirm_coordinates*scale_factor)
         time.sleep(mouse_move_wait_time)
-        pyautogui.click(confirm_coordinates)
+        pyautogui.click(confirm_coordinates*scale_factor)
         time.sleep(mouse_click_wait_time)
+        album['Actions'] = ['Deleted on ' + time.strftime('%Y-%m-%d %H:%M:%S')]
         # Finally, lets close the web browser tab
         if platform.system() == 'Darwin':  # Darwin is the name for the macOS operating system
             pyautogui.hotkey('cmd', 'w')
@@ -197,15 +282,17 @@ def delete_albums(albums_to_delete, max_albums_to_delete, three_dots_coordinates
             pyautogui.hotkey('ctrl', 'w')
         time.sleep(mouse_click_wait_time)
         albums_deleted += 1
-        
-def find_albums_to_rename(album_list):
-    albums_to_rename = []
-    for album in album_list:
+        return album_list
+
+def mark_albums_to_rename(album_list):
+    for index, album in album_list.iterrows():
         # Find albums with 'Copy of 'in the name
-        if 'Copy of ' in album[0]:
-            album.append(album[0].replace('Copy of ', ''))
-            albums_to_rename.append(album)
-    return albums_to_rename
+        if 'Copy of ' in album['Album Title']:
+            album_list.at[index, 'Album New Title'] = album['Album Title'].replace('Copy of ', '')
+    return album_list
+
+def rename_albums(album_list, max_albums_to_delete, three_dots, rename_button, rename_textbox, rename_save_button):
+    return album_list
 
 def main():
     # Read the configuration file into memory
@@ -213,39 +300,71 @@ def main():
     if parameters == False:
         logging.error(f"Failed to read config file {CONFIG_FILENAME}. Exiting.")
         exit()
-    
-    # If the album list markdown file doesn't exist, create it by calling the Google Photos API
-    if not os.path.exists(parameters['album_list_file']):
-        album_list = google_photos_album_lister(parameters['scopes'], parameters['credentials_file'], parameters['token_file'], parameters['album_list_length_limit'])
-        table = tabulate(album_list, headers=['Album Title','Number of Photos','Sharing','Album ID','URL'], tablefmt='pipe')
-        with open(parameters['album_list_file'], 'w') as f:
-            f.write(table)
-        logging.info('Created new album list markdown file.')
-    # Otherwise, read the album list markdown file
-    else:
-        logging.info('Album list file already exists.  Not creating a new one.')
-        album_list = read_album_list_from_file(parameters['album_list_file'])
 
-    # Find the albums to delete based on criteria in the find_albums_to_delete function
-    albums_to_delete = find_albums_to_delete(album_list, parameters['delete_empty_albums'], parameters['delete_albums_that_contain'])
+    while True:
+        print("\nGoogle Photos Album Cleanup Menu:")
+        print("1. Download the full album list from Google Photos and save to a file in the current directory")
+        print("2. Modify the full album list from option 1 to generate a list of albums to RENAME based on script criteria")
+        print("3. Use the full album list from option 1 to generate a list of albums to DELETE based on script criteria")
+        print("4. Record mouse movements for deleting and renaming albums")
+        print("5. Drive the mouse and rename albums based on the list of albums to rename")
+        print("6. Drive the mouse and delete albums based on the list of albums to delete")
+        print("Q. Quit")
 
-    # If there are no albums to delete, exit
-    if not albums_to_delete:
-        logging.info('No albums to delete.')
-        exit()
-    # Otherwise, write the list of albums to delete to a markdown file
-    else:
-        table = tabulate(albums_to_delete, headers=['Album Title','Number of Photos','Sharing','Album ID','URL'], tablefmt='pipe')
-        with open(parameters['albums_to_delete_list_file'], 'w'):
-            pass
-        logging.info('Cleared previous markdown file of albums to delete.')
-        with open(parameters['albums_to_delete_list_file'], 'w') as f:
-            f.write(table)
-        logging.info('Created markdown file of albums to delete.')
+        option = input("Please select an option: ")
 
-    # Delete the albums
-    if parameters['delete_albums']:
-        delete_albums(albums_to_delete, parameters['max_albums_to_delete'], parameters['three_dots'], parameters['delete_button'], parameters['confirm_delete_button'])
+        if option == '1':
+            # Check if the file exists
+            if os.path.exists(parameters['album_list_file']):
+                # Ask the user if they want to overwrite the file
+                overwrite = input('Album list file already exists. Do you want to overwrite it? (y/n): ')
+                if overwrite.lower() != 'y':
+                    print('File not overwritten. Going back to main menu.')
+                    continue
+            # Call the function to download the album list and write to a file
+            album_list = google_photos_album_lister(parameters['scopes'], parameters['credentials_file'], parameters['token_file'], parameters['album_list_length_limit'])
+            write_xlsx_with_renamed_columns(album_list, parameters['album_list_file'])
+            print('The file can be further processed by the script in options 2 and 3, or you can edit the file yourself and use options 4, then 5 and 6.')
+        elif option == '2':
+            if not os.path.exists(parameters['album_list_file']):
+                print('No album list file found. Please run option 1 first.')
+                continue
+            album_list = read_xlsx_with_renamed_columns(parameters['album_list_file'])
+            album_list = mark_albums_to_rename(album_list)
+            write_xlsx_with_renamed_columns(album_list, parameters['album_list_file'])
+
+        elif option == '3':
+            if not os.path.exists(parameters['album_list_file']):
+                print('No album list file found. Please run option 1 first.')
+                continue
+            album_list = read_xlsx_with_renamed_columns(parameters['album_list_file'])
+            album_list = mark_albums_to_delete(album_list, parameters['delete_empty_albums'], parameters['delete_albums_that_contain'])
+            write_xlsx_with_renamed_columns(album_list, parameters['album_list_file'])
+
+        elif option == '4':
+            # Assuming MouseClickFinderScript.py is in the same directory and has a main() function
+            import MouseClickFinderScript
+            MouseClickFinderScript.main()
+
+        elif option == '5':
+            confirm = input('You will not be able to use your computer during this time. Continue? (y/n): ')
+            if confirm.lower() != 'y':
+                continue
+            album_list = read_xlsx_with_renamed_columns(parameters['album_list_file'])
+            album_list = rename_albums(album_list, parameters['max_albums_to_delete'], parameters['three_dots'], parameters['rename_button'], parameters['rename_textbox'], parameters['rename_save_button'])
+            write_xlsx_with_renamed_columns(album_list, parameters['album_list_file'])
+
+        elif option == '6':
+            confirm = input('You will not be able to use your computer during this time. Continue? (y/n): ')
+            if confirm.lower() != 'y':
+                continue
+            album_list = read_xlsx_with_renamed_columns(parameters['album_list_file'])
+            album_list = delete_albums(album_list, parameters['max_albums_to_delete'], parameters['macos_scale_factor'], parameters['three_dots'], parameters['delete_button'], parameters['confirm_delete_button'])
+            write_xlsx_with_renamed_columns(album_list, parameters['album_list_file'])
+        elif option.lower() == 'q':
+            break
+        else:
+            print("Invalid option. Please try again.")
 
 if __name__ == "__main__":
     main()
